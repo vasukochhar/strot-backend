@@ -1,26 +1,19 @@
-import { Request, Response, NextFunction } from 'express';
+import { Response, NextFunction } from 'express';
+import { AuthRequest } from './authMiddleware';
 
-type JwtUser = {
-  id: string;
-  role: 'admin' | 'candidate' | 'employer';
-};
+const ALLOWED_EMAILS = new Set(
+  (process.env.ALLOWED_EMAILS || 'vasu.kochhar@gmail.com,shanas.nakade@strot.net')
+    .split(',')
+    .map(e => e.trim().toLowerCase())
+);
 
-declare module 'express-serve-static-core' {
-  interface Request {
-    user?: JwtUser;
-  }
-}
-
-/**
- * Requires an authenticated admin.
- * Assumes authMiddleware has already populated req.user.
- */
-export default function adminOnly(req: Request, res: Response, next: NextFunction) {
-  if (!req.user) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  if (req.user.role !== 'admin') {
+export const adminOnly = (req: AuthRequest, res: Response, next: NextFunction) => {
+  if (
+    req.user?.role !== 'admin' ||
+    req.user?.account_status !== 'active' ||
+    !ALLOWED_EMAILS.has(req.user?.email.toLowerCase())
+  ) {
     return res.status(403).json({ error: 'Forbidden: admin access only' });
   }
-  return next();
-}
+  next();
+};

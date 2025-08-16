@@ -1,69 +1,157 @@
-import { Router, RequestHandler } from 'express';
+// src/routes/adminRoutes.ts
+import { Router, Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { pool } from '../db';
 
 type UserRole = 'admin' | 'candidate' | 'employer';
-type AccountStatus = 'pending' | 'active';
-type AuthPayload = { sub: number; email: string; role: UserRole; account_status: AccountStatus };
+type AccountStatus = 'pending' | 'active' | 'banned';
 
+type JwtClaims = {
+  sub: number;                 // integer user id
+  email: string;
+  role: UserRole;
+  account_status?: AccountStatus;
+  iat?: number;
+  exp?: number;
+};
+
+const router = Router();
+
+// ---- Version tag so we can prove this file is loaded ----
+const ADMIN_ROUTES_VERSION = 'v3-int-id-2025-08-14';
+console.log(`Loaded adminRoutes.ts (${ADMIN_ROUTES_VERSION}) at`, new Date().toISOString());
+
+// ---- Config ----
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
 const ALLOWED_EMAILS = new Set(
   (process.env.ALLOWED_EMAILS || 'vasu.kochhar@gmail.com,shanas.nakade@strot.net')
     .split(',')
     .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
 );
 
-// Local guard to avoid import/handler glitches
-const verifyAdmin: RequestHandler = (req, res, next) => {
+const isDev = process.env.NODE_ENV !== 'production';
+const log = (...args: any[]) => { if (isDev) console.log(...args); };
+
+// ---- Helpers ----
+const badRequest = (res: Response, message: string) =>
+  res.status(400).json({ error: 'bad_request', message });
+
+const forbidden = (res: Response, message = 'Admin access required') =>
+  res.status(403).json({ error: 'forbidden', message });
+
+const unauthorized = (res: Response, message = 'Invalid or expired token') =>
+  res.status(401).json({ error: 'unauthorized', message });
+
+// ---- Admin guard ----
+async function verifyAdmin(req: Request, res: Response, next: NextFunction) {
   const h = req.headers.authorization;
-  if (!h?.startsWith('Bearer ')) { res.status(401).json({ error: 'Authorization header missing or malformed' }); return; }
-  const token = h.slice(7).trim();
+  if (!h?.startsWith('Bearer ')) return unauthorized(res, 'Authorization header missing or malformed');
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as Partial<AuthPayload>;
+    const token = h.slice(7).trim();
+    const decoded = jwt.verify(token, JWT_SECRET) as Partial<JwtClaims>;
+
     if (!decoded?.sub || !decoded.email || !decoded.role) {
-      res.status(401).json({ error: 'Invalid token payload' }); return;
+      return unauthorized(res, 'Invalid token payload');
     }
-    if (
-      decoded.role !== 'admin' ||
-      !ALLOWED_EMAILS.has(decoded.email.toLowerCase()) ||
-      decoded.account_status !== 'active'
-    ) {
-      res.status(403).json({ error: 'Forbidden: admin access only' }); return;
+
+    const email = String(decoded.email).toLowerCase();
+    if (!ALLOWED_EMAILS.has(email)) {
+      return forbidden(res, 'Admin login restricted to whitelisted emails');
     }
-    (req as any).user = decoded as AuthPayload; // attach if needed downstream
-    next();
-  } catch {
-    res.status(401).json({ error: 'Invalid or expired token' });
-  }
-};
 
-const router = Router();
-
-console.log('Loaded adminRoutes.ts (waitlist routes) at', new Date().toISOString());
-
-// Health ping (kept)
-router.get('/ping', (_req, res) => res.json({ pong: true }));
-
-// GET /api/admin/waitlist → list all pending users
-router.get('/waitlist', verifyAdmin, async (_req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, email, role, account_status, created_at
+    // Double‑check against DB (authoritative)
+    const { rows } = await pool.query<{
+      id: number; role: UserRole; account_status: AccountStatus; email: string;
+    }>(
+      `SELECT id, role, account_status, email
          FROM users
-        WHERE account_status = 'pending'
-        ORDER BY created_at DESC`
+        WHERE id = $1
+        LIMIT 1`,
+      [Number(decoded.sub)]
     );
-    res.json({ count: rows.length, users: rows });
+
+    if (rows.length === 0) {
+      return unauthorized(res, 'User not found for this token');
+    }
+
+    const admin = rows[0];
+    if (admin.role !== 'admin') return forbidden(res, 'Admin role required');
+    if (admin.account_status !== 'active') return forbidden(res, 'Admin account is not active');
+
+    (req as any).user = { id: admin.id, email: admin.email };
+    next();
+  } catch (err) {
+    return unauthorized(res);
+  }
+}
+
+// ---- Routes ----
+
+// Protected version ping (since your app mounts admin under authMiddleware)
+router.get('/ping', verifyAdmin, (_req, res) => {
+  res.json({ pong: true, version: ADMIN_ROUTES_VERSION });
+});
+
+// GET /api/admin/waitlist → pending users
+router.get('/waitlist', verifyAdmin, async (req, res) => {
+  const q = (req.query.q as string | undefined)?.trim();
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit || '50'), 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(String(req.query.offset || '0'), 10) || 0, 0);
+
+  try {
+    let where = `WHERE account_status = 'pending'`;
+    const params: any[] = [];
+
+    if (q) {
+      params.push(`%${q}%`);
+      where += ` AND email ILIKE $${params.length}`;
+    }
+
+    params.push(limit);
+    params.push(offset);
+
+    const sql = `
+      SELECT id, email, role, account_status, created_at
+        FROM users
+        ${where}
+       ORDER BY created_at DESC
+       LIMIT $${params.length - 1}
+      OFFSET $${params.length}
+    `;
+
+    const [list, total] = await Promise.all([
+      pool.query(sql, params),
+      pool.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM users ${q ? `WHERE account_status = 'pending' AND email ILIKE $1` : `WHERE account_status = 'pending'`}`,
+        q ? [`%${q}%`] : []
+      ),
+    ]);
+
+    res.json({
+      count: Number(total.rows[0]?.count || 0),
+      users: list.rows,
+    });
   } catch (error) {
     console.error('Error fetching waitlist:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// POST /api/admin/users/:id/activate → approve + ensure profile
+/**
+ * POST /api/admin/users/:id/activate
+ * Activates a user by **INTEGER** id and ensures a profile row.
+ */
 router.post('/users/:id/activate', verifyAdmin, async (req, res) => {
   const { id } = req.params;
+
+  // ✅ your schema uses SERIAL INTEGER ids
+  if (!/^\d+$/.test(id)) {
+    return badRequest(res, 'Invalid user id (must be an integer)');
+  }
+  const userId = Number(id);
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -71,34 +159,34 @@ router.post('/users/:id/activate', verifyAdmin, async (req, res) => {
     const activate = await client.query(
       `UPDATE users
           SET account_status = 'active',
-              approved_at    = NOW()
+              approved_at    = NOW(),
+              updated_at     = NOW()
         WHERE id = $1
         RETURNING id, email, role, account_status, approved_at`,
-      [id]
+      [userId]
     );
 
     if (activate.rowCount === 0) {
       await client.query('ROLLBACK');
-      res.status(404).json({ error: 'User not found' });
-      return;
+      return res.status(404).json({ error: 'not_found', message: 'User not found' });
     }
 
     await client.query(
       `INSERT INTO profiles (user_id, created_at, updated_at)
        VALUES ($1, NOW(), NOW())
        ON CONFLICT (user_id) DO NOTHING`,
-      [id]
+      [userId]
     );
 
     await client.query('COMMIT');
-    res.json({
+    return res.json({
       message: `User ${activate.rows[0].email} activated and profile ensured.`,
       user: activate.rows[0],
     });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error activating user:', error);
-    res.status(500).json({ error: 'Server error' });
+    return res.status(500).json({ error: 'server_error', message: 'Failed to activate user' });
   } finally {
     client.release();
   }
