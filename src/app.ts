@@ -45,13 +45,12 @@ const allowedOrigins = (
     : [FRONTEND_ORIGIN]
 );
 
-// If behind a proxy / load balancer (Nginx/IONOS), keep this on
+// If behind a proxy / load balancer, keep this on
 app.set('trust proxy', 1);
 
 /* -------------------------------- CORS ------------------------------------ */
 app.use((_, res, next) => {
-  // Important for caches when echoing Access-Control-Allow-Origin
-  res.setHeader('Vary', 'Origin');
+  res.setHeader('Vary', 'Origin'); // important when echoing A-C-A-O
   next();
 });
 
@@ -66,9 +65,7 @@ const corsOptions: cors.CorsOptions = {
   allowedHeaders: ['Authorization', 'Content-Type'],
   optionsSuccessStatus: 204,
 };
-
 app.use(cors(corsOptions));
-// NOTE: do NOT add app.options('*', ...) to avoid path-to-regexp quirks
 
 /* --------------------------- Security headers ----------------------------- */
 app.use(
@@ -101,8 +98,7 @@ app.get('/api/protected', authMiddleware, (req: Request, res: Response) => {
 });
 
 /* ----------------------------- 404 & Errors ------------------------------- */
-// App-level 404 (no wildcard path—safe with path-to-regexp)
-app.use((req, res, _next) => {
+app.use((req, res) => {
   res.status(404).json({ error: 'Not Found', path: req.originalUrl });
 });
 
